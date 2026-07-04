@@ -1,4 +1,4 @@
-# Netflix Clone
+# streamflix
 
 A production-style streaming app: Netflix-level UX patterns (browse rails, hover previews,
 continue watching, adaptive playback) built with original branding, placeholder assets, and
@@ -118,26 +118,5 @@ npm run dev
 # → http://localhost:3000/api/health   ({ status: "ok" })
 ```
 
-## Roadmap
-
-| # | Phase | Status |
-|---|---|---|
-| 1 | Folder structure | ✅ Done |
-| 2 | Database schema | ✅ Done |
-| 3 | Authentication | ⬜ Next |
-| 4 | API development | ⬜ |
-| 5 | UI components | ⬜ |
-| 6 | Layout | ⬜ |
-| 7 | Pages | ⬜ |
-| 8 | State management | ⬜ |
-| 9 | Video streaming | ⬜ |
-| 10 | Search | ⬜ |
-| 11 | Recommendation engine | ⬜ |
-| 12 | Admin panel | ⬜ |
-| 13 | Testing | ⬜ |
-| 14 | Deployment | ⬜ |
-| 15 | Docker setup | ⬜ |
-| 16 | GitHub Actions | ⬜ |
-| 17 | Documentation | ⬜ |
 
 Each phase will build on this foundation without restructuring it.
