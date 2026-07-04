@@ -1,0 +1,594 @@
+// =====================================================================
+// NETFLIX CLONE — DATABASE SCHEMA
+// =====================================================================
+// Phase 2 of 17. Provider: PostgreSQL. ORM: Prisma.
+//
+// Design notes:
+// - IDs use cuid() — sortable-ish, collision-resistant, no round trip
+//   to the DB needed to generate one (useful for optimistic UI).
+// - "Movie vs Series" content is modeled as two distinct tables rather
+//   than one polymorphic "Content" table. This trades a bit of
+//   duplication (title, slug, description, etc. appear twice) for
+//   simple, type-safe Prisma queries — no discriminator-column
+//   gymnastics in application code.
+// - Join models where a user/profile can point at EITHER a Movie OR a
+//   Series (Review, Rating, Favorite, WatchlistItem) use two nullable
+//   FKs (movieId / seriesId) rather than true polymorphism, since
+//   Prisma has no native polymorphic relations. Postgres treats NULLs
+//   as distinct for UNIQUE constraints, so the @@unique pairs below
+//   work correctly. A CHECK constraint enforcing "exactly one of
+//   movieId/seriesId is set" should be added via a follow-up raw SQL
+//   migration (Prisma can't express CHECK constraints natively yet).
+// - Full-text search (Phase 10) will add a generated tsvector column +
+//   GIN index on Movie/Series via raw SQL migration, since Prisma's
+//   PostgreSQL support doesn't manage tsvector columns declaratively.
+//   This schema is written so that migration is additive, not a
+//   redesign.
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum AuthProvider {
+  CREDENTIALS
+  GOOGLE
+  GITHUB
+}
+
+enum ProfileType {
+  ADULT
+  KIDS
+}
+
+enum ContentStatus {
+  DRAFT
+  PENDING_REVIEW
+  PUBLISHED
+  ARCHIVED
+}
+
+enum MaturityRating {
+  G
+  PG
+  PG_13
+  R
+  NC_17
+  TV_Y
+  TV_Y7
+  TV_G
+  TV_PG
+  TV_14
+  TV_MA
+}
+
+enum RatingValue {
+  LIKE
+  DISLIKE
+}
+
+enum SubscriptionPlan {
+  FREE
+  BASIC
+  STANDARD
+  PREMIUM
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  SUCCEEDED
+  PENDING
+  FAILED
+  REFUNDED
+}
+
+enum NotificationType {
+  NEW_RELEASE
+  RECOMMENDATION
+  SUBSCRIPTION
+  SYSTEM
+  CONTENT_UPDATE
+}
+
+// ---------------------------------------------------------------------
+// IDENTITY & ACCESS
+// ---------------------------------------------------------------------
+
+model User {
+  id            String       @id @default(cuid())
+  email         String       @unique
+  emailVerified DateTime?
+  passwordHash  String? // null for OAuth-only accounts
+  name          String?
+  avatarUrl     String?
+  role          Role         @default(USER)
+  provider      AuthProvider @default(CREDENTIALS)
+  providerId    String? // OAuth subject id from Google/GitHub
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  profiles      Profile[]
+  subscription  Subscription?
+  payments      Payment[]
+  sessions      Session[]
+  refreshTokens RefreshToken[]
+  notifications Notification[]
+  reviews       Review[]
+  ratings       Rating[]
+
+  @@unique([provider, providerId])
+  @@index([email])
+  @@map("users")
+}
+
+model Profile {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name             String
+  avatarUrl        String?
+  type             ProfileType    @default(ADULT)
+  pinHash          String? // optional profile lock, hashed
+  language         String         @default("en")
+  autoplayNext     Boolean        @default(true)
+  autoplayPreviews Boolean        @default(true)
+  maturityLimit    MaturityRating @default(TV_MA)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  watchHistory     WatchHistory[]
+  favorites        Favorite[]
+  watchlistItems   WatchlistItem[]
+  continueWatching ContinueWatching[]
+
+  @@index([userId])
+  @@map("profiles")
+}
+
+model Session {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  sessionToken String  @unique
+  userAgent    String?
+  ipAddress    String?
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model RefreshToken {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tokenHash  String  @unique
+  revoked    Boolean @default(false)
+  replacedBy String?
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------
+// CATALOG
+// ---------------------------------------------------------------------
+
+model Genre {
+  id   String @id @default(cuid())
+  name String @unique
+  slug String @unique
+
+  movies MovieGenre[]
+  series SeriesGenre[]
+
+  @@map("genres")
+}
+
+model Actor {
+  id       String  @id @default(cuid())
+  name     String
+  photoUrl String?
+  bio      String? @db.Text
+
+  movieCredits  MovieCast[]
+  seriesCredits SeriesCast[]
+
+  @@index([name])
+  @@map("actors")
+}
+
+model Movie {
+  id             String         @id @default(cuid())
+  title          String
+  slug           String         @unique
+  description    String         @db.Text
+  releaseYear    Int
+  runtimeMinutes Int
+  maturityRating MaturityRating
+  director       String?
+
+  posterUrl   String?
+  backdropUrl String?
+  trailerUrl  String?
+  videoUrl    String? // source file in Cloudinary
+  videoHlsUrl String? // adaptive-bitrate manifest (.m3u8)
+
+  status     ContentStatus @default(DRAFT)
+  isOriginal Boolean       @default(false)
+  isFeatured Boolean       @default(false)
+
+  popularity  Float @default(0)
+  voteAverage Float @default(0)
+  voteCount   Int   @default(0)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  publishedAt DateTime?
+
+  genres           MovieGenre[]
+  cast             MovieCast[]
+  reviews          Review[]
+  ratings          Rating[]
+  favorites        Favorite[]
+  watchlistItems   WatchlistItem[]
+  watchHistory     WatchHistory[]
+  continueWatching ContinueWatching[]
+
+  @@index([slug])
+  @@index([status])
+  @@index([releaseYear])
+  @@index([isFeatured])
+  @@map("movies")
+}
+
+model Series {
+  id             String         @id @default(cuid())
+  title          String
+  slug           String         @unique
+  description    String         @db.Text
+  firstAirYear   Int
+  lastAirYear    Int?
+  maturityRating MaturityRating
+
+  posterUrl   String?
+  backdropUrl String?
+  trailerUrl  String?
+
+  status     ContentStatus @default(DRAFT)
+  isOriginal Boolean       @default(false)
+  isFeatured Boolean       @default(false)
+  isOngoing  Boolean       @default(true)
+
+  popularity  Float @default(0)
+  voteAverage Float @default(0)
+  voteCount   Int   @default(0)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  publishedAt DateTime?
+
+  genres         SeriesGenre[]
+  cast           SeriesCast[]
+  seasons        Season[]
+  reviews        Review[]
+  ratings        Rating[]
+  favorites      Favorite[]
+  watchlistItems WatchlistItem[]
+
+  @@index([slug])
+  @@index([status])
+  @@index([isFeatured])
+  @@map("series")
+}
+
+model Season {
+  id       String @id @default(cuid())
+  seriesId String
+  series   Series @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  seasonNumber Int
+  title        String?
+  overview     String? @db.Text
+  posterUrl    String?
+  releaseYear  Int?
+
+  episodes Episode[]
+
+  @@unique([seriesId, seasonNumber])
+  @@map("seasons")
+}
+
+model Episode {
+  id       String @id @default(cuid())
+  seasonId String
+  season   Season @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  episodeNumber  Int
+  title          String
+  description    String @db.Text
+  runtimeMinutes Int
+
+  thumbnailUrl String?
+  videoUrl     String?
+  videoHlsUrl  String?
+
+  airDate DateTime?
+
+  watchHistory     WatchHistory[]
+  continueWatching ContinueWatching[]
+
+  @@unique([seasonId, episodeNumber])
+  @@map("episodes")
+}
+
+// --- catalog join tables -----------------------------------------------
+
+model MovieGenre {
+  movieId String
+  movie   Movie  @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  genreId String
+  genre   Genre  @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([movieId, genreId])
+  @@map("movie_genres")
+}
+
+model SeriesGenre {
+  seriesId String
+  series   Series @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  genreId  String
+  genre    Genre  @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([seriesId, genreId])
+  @@map("series_genres")
+}
+
+model MovieCast {
+  movieId   String
+  movie     Movie   @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  actorId   String
+  actor     Actor   @relation(fields: [actorId], references: [id], onDelete: Cascade)
+  character String?
+  order     Int     @default(0)
+
+  @@id([movieId, actorId])
+  @@map("movie_cast")
+}
+
+model SeriesCast {
+  seriesId  String
+  series    Series  @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  actorId   String
+  actor     Actor   @relation(fields: [actorId], references: [id], onDelete: Cascade)
+  character String?
+  order     Int     @default(0)
+
+  @@id([seriesId, actorId])
+  @@map("series_cast")
+}
+
+// ---------------------------------------------------------------------
+// ENGAGEMENT (reviews, ratings, lists, history)
+// ---------------------------------------------------------------------
+
+model Review {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  movieId  String?
+  movie    Movie?  @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  seriesId String?
+  series   Series? @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  content String  @db.Text
+  spoiler Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([movieId])
+  @@index([seriesId])
+  @@map("reviews")
+}
+
+model Rating {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  movieId  String?
+  movie    Movie?  @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  seriesId String?
+  series   Series? @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  value RatingValue
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, movieId])
+  @@unique([userId, seriesId])
+  @@index([userId])
+  @@map("ratings")
+}
+
+model Favorite {
+  id        String  @id @default(cuid())
+  profileId String
+  profile   Profile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  movieId  String?
+  movie    Movie?  @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  seriesId String?
+  series   Series? @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([profileId, movieId])
+  @@unique([profileId, seriesId])
+  @@map("favorites")
+}
+
+model WatchlistItem {
+  id        String  @id @default(cuid())
+  profileId String
+  profile   Profile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  movieId  String?
+  movie    Movie?  @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  seriesId String?
+  series   Series? @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  addedAt DateTime @default(now())
+
+  @@unique([profileId, movieId])
+  @@unique([profileId, seriesId])
+  @@map("watchlist_items")
+}
+
+model WatchHistory {
+  id        String  @id @default(cuid())
+  profileId String
+  profile   Profile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  movieId   String?
+  movie     Movie?   @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  episodeId String?
+  episode   Episode? @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  watchedAt       DateTime @default(now())
+  progressSeconds Int      @default(0)
+  completed       Boolean  @default(false)
+
+  @@index([profileId])
+  @@index([movieId])
+  @@index([episodeId])
+  @@map("watch_history")
+}
+
+// Separate from WatchHistory: this holds exactly one row per
+// (profile, title) with the *current* resume point, so the "Continue
+// Watching" rail is a straight indexed lookup instead of a
+// group-by-latest query over full history on every home-page load.
+model ContinueWatching {
+  id        String  @id @default(cuid())
+  profileId String
+  profile   Profile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  movieId   String?
+  movie     Movie?   @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  episodeId String?
+  episode   Episode? @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  progressSeconds Int
+  durationSeconds Int
+  updatedAt       DateTime @updatedAt
+
+  @@unique([profileId, movieId])
+  @@unique([profileId, episodeId])
+  @@index([profileId])
+  @@map("continue_watching")
+}
+
+// ---------------------------------------------------------------------
+// BILLING
+// ---------------------------------------------------------------------
+
+model Subscription {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  plan   SubscriptionPlan   @default(FREE)
+  status SubscriptionStatus @default(ACTIVE)
+
+  stripeCustomerId     String? @unique
+  stripeSubscriptionId String? @unique
+  stripePriceId        String?
+
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments Payment[]
+
+  @@map("subscriptions")
+}
+
+model Payment {
+  id             String        @id @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  stripePaymentIntentId String?       @unique
+  amountCents           Int
+  currency              String        @default("usd")
+  status                PaymentStatus
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("payments")
+}
+
+// ---------------------------------------------------------------------
+// NOTIFICATIONS
+// ---------------------------------------------------------------------
+
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type    NotificationType
+  title   String
+  message String
+  link    String?
+  read    Boolean          @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([userId, read])
+  @@map("notifications")
+}
